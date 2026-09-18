@@ -1,0 +1,19 @@
+.env
+*.exe
+/dist
+/tools
+/.VSCodeCounter
+datastore.json*
+/data/store/
+*.txt
+*private*
+datastore_dump.json
+*.json
+*.exe~
+dump.bat
+/.cursor
+cora-discord
+/data/cache/
+
+# Served by GitHub Pages from the repo root; *.txt above would hide it.
+!robots.txt

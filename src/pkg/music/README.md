@@ -1,0 +1,239 @@
+# music
+
+Queue-based music playback library for Go with pluggable audio sinks and track resolvers. Resolves URLs and search queries (YouTube, SoundCloud, radio) and opens each track as a stream of 20ms Opus packets — YouTube plays by **Opus passthrough** (WebM demux, no ffmpeg, no transcode); other sources transcode through ffmpeg and encode to Opus. Plays through a sink of your choice (forward to Discord voice, or decode to a speaker).
+
+## How it works (high level)
+
+At runtime the system is a pipeline:
+
+- **Resolve** user input → `sources.TrackInfo` (URL, title, available parsers)
+- **Enqueue** resolved tracks into a FIFO queue
+- **Open stream** using one of the available parsers (20ms Opus packets, 48kHz stereo)
+- **Stream to sink** (speaker / Discord / custom) until the track ends or fails
+- **Recover** when possible (parser fallback on instant-open failures; reopen on early EOF; special handling for voice transport)
+
+```mermaid
+flowchart TD
+  A["User input<br/>URL / search"] --> B["Resolver.Resolve()"]
+  B --> C["TrackInfo + AvailableParsers"]
+  C --> D["Player.Enqueue()"]
+  D --> E["Player.PlayNext()"]
+  E --> F["RecoveryStream.Start(0)<br/>once, before anything reads"]
+  F --> G{"any parser opened?"}
+  G -- no --> X["skip the track"]
+  X --> E
+  G -- yes --> H["Sink.Stream(rs.Packets())"]
+  H --> I{"read error?"}
+  I -- no --> H
+  I -- "io.EOF early" --> J["reopen the same parser<br/>at the current position"]
+  I -- "instant fail (first read)" --> K["advance parserIndex"]
+  I -- "reopen requested" --> J
+  J --> H
+  K --> J
+  H --> Z{"how did Stream return?"}
+  Z -- "nil — track ended" --> M["completion goroutine → PlayNext()"]
+  Z -- ErrVoiceTransport --> Q["rs.RequestReopen()<br/>then re-acquire the sink"]
+  Q --> H
+  Z -- ErrPlaybackStopped --> S["stop; the caller decides what is next"]
+  Z -- "other error" --> M
+  M --> E
+```
+
+Everything between `Sink.Stream` and `how did Stream return?` happens on the
+goroutine pulling packets, and the player never sees it: a parser dying on its
+first read, a source ending early, a reopen it asked for — all of it is
+absorbed inside `ReadPacket`. Only two things surface. The track ended, or the
+voice transport did.
+
+`RequestReopen` is on that list rather than above it because it is a request,
+not a reopen: the player raises a flag and the reading goroutine services it.
+Reopening from the player's own goroutine rewrites the parser index, the
+position, the retry counts and a map, under whoever is reading them — see
+[ownership.md](../../docs/ownership.md) rule 3.
+
+## Install
+
+```bash
+go get github.com/keshon/melodix/pkg/music/...
+```
+
+## Quick start
+
+Create a sink provider (e.g. speaker for local playback), a resolver, and a player; then enqueue and play:
+
+```go
+provider := sink.NewSpeakerProvider()
+defer provider.Close()
+
+res := resolve.New()
+p := player.New(provider, res)
+
+// Enqueue a URL or search query, then start playback
+_ = p.Enqueue("https://www.youtube.com/watch?v=...", "", "")
+_ = p.PlayNext("")  // "" for local; use voice channel ID for Discord
+```
+
+Listen to `p.PlayerStatus` for status updates (Playing, Added, Stopped, Error). See [examples/clispeaker](examples/clispeaker) for a full runnable CLI.
+
+## Algorithms (by stage)
+
+### 1) Resolve (input → TrackInfo)
+
+Goal: convert user input into canonical metadata + a parser preference list.
+
+- **Input**: URL or search query + optional `source`/`parser` hints.
+- **Output**: `[]sources.TrackInfo` where `TrackInfo.AvailableParsers` is ordered by preference.
+
+The resolver is intentionally pluggable; the player does not care *how* a track was discovered, only that it has a URL + parsers list.
+
+### 2) Enqueue (TrackInfo → queue)
+
+Goal: turn `TrackInfo` into `parsers.Track` and append to the FIFO queue.
+
+- Tracks without `AvailableParsers` are rejected/skipped.
+- `CurrentParser` starts as the first entry in `AvailableParsers` (will be updated later by recovery/open logic).
+
+### 3) Start playback (dequeue → open resilient stream)
+
+Performed by `Player.PlayNext()`:
+
+- If something is playing, stop it.
+- Pop the next track from the queue.
+- Create `stream.NewRecoveryStream(track)` and call `rs.Start(seek=0)`, which
+  returns an `OpenInfo` describing what actually opened. `Start` may be called
+  once, before anything reads; every later open happens on the reading
+  goroutine (see Ownership below).
+- If open fails for all parsers, skip the track and try the next.
+
+### 4) Open stream (choose parser)
+
+Performed inside `RecoveryStream.open(seek)`, reached from `Start` once and
+from `ReadPacket` thereafter:
+
+- Starting at `parserIndex`, iterate through `track.SourceInfo.AvailableParsers`.
+- For each parser:
+  - if `retries[parser] >= maxRecoveryAttempts` → skip
+  - try `openWithParser(track, parser, seek)`
+  - on success:
+    - set `parserIndex` to that parser’s index
+    - set `track.CurrentParser = parser`
+    - reset `firstRead = true`
+    - store cleanup + current seek
+    - log `stream_opening`
+
+A successful open is **not** proof that audio will flow: an ffmpeg-backed parser
+has only spawned a process at this point, and a CDN 403 surfaces on the first
+read. The parser is *confirmed* when `ReadPacket` returns its first packet —
+that is where `stream_opened` is logged and the `SetOnParserConfirmed` callback
+fires, so a consumer learns which parser is really playing rather than which one
+merely opened. `player.Player` hangs both user-visible consequences off it: the
+playback-history row, and a re-render of "Now Playing" when the confirmed parser
+differs from the one already announced.
+
+### 5) Media recovery (parser/ffmpeg level)
+
+Recovery is intentionally conservative to avoid false-positive “fallback” when a track naturally ends.
+
+**A) Instant failure right after open**
+
+If the very first `Read()` on the opened stream returns any error (including an EOF-like failure from ffmpeg), it is treated as an *instant fail*:
+
+- close/cleanup current stream
+- `parserIndex++`
+- open again at the current `seekSec` using the next parser
+
+This is designed for cases like “ffmpeg opened, then immediately 403/forbidden and closed stdout”.
+
+**B) Early end (mid-track)**
+
+If a read fails partway through a track, recovery reopens the same parser:
+
+- close/cleanup current stream
+- reopen at the current approximate `seekSec`
+- retries are bounded by `maxRecoveryAttempts` per parser
+
+Any read failure counts, not only `io.EOF`. A CDN resetting the connection
+arrives as a net error, and the passthrough path surfaces that raw — nothing
+sits between it and the socket — so restricting recovery to EOF let those
+tracks die where an ffmpeg-fronted one would have recovered.
+
+"Partway through" needs a duration to mean anything: with one, it means
+stopping before ~95% of it. Without one — internet radio, and YouTube live —
+there is no natural end, so every stop is an interruption and the stream
+reconnects at the live edge (`seek 0`) after a short backoff, still bounded by
+`maxRecoveryAttempts`.
+
+### 6) Sink streaming + voice transport recovery
+
+The sink drives the read loop via `AudioSink.Stream(reader, stopCh)`:
+
+- On normal completion: the track ends → player advances to the next track.
+- On `stream.ErrVoiceTransport` (Discord transport issues):
+  - the player can invalidate/rejoin the sink (hard) or retry without rejoin (soft mode)
+  - then calls `rs.RequestReopen()`, which asks the reading goroutine to reopen
+    media at the current seek rather than reopening it from the player's own
+    goroutine -- see Ownership below
+- On user stop/skip: playback stops cleanly.
+
+### Discord / UI: errors and `PlayerStatus`
+
+`Player.PlayerStatus` is a buffered channel meant for a **single long-lived consumer** per player (competing receivers steal events). The Discord voice service runs one status watcher per guild player for async transitions (auto-advance to the next track, natural queue end); slash handlers render interaction-driven outcomes (“Now Playing” / “Track(s) Added”) synchronously since `PlayNext`/enqueue results are known in the handler. The player stores a capped `lastPlaybackUserErr` for consistent embed text.
+
+When wired to Discord, the voice service passes `Options.OnPlaybackFailed` at player construction so a failure after “Now Playing” can **edit the guild status message** (same message id as “Now Playing”) instead of relying on an interaction follow-up that already finished.
+
+The **ffmpeg**, **kkdai**, **ytnative** and **soundcloudapi** packages use package-level loggers: call their `SetLogger(appLogger)` once at process startup (the Discord bot does this in `NewBot`). All parsers build their ffmpeg invocation via `ffmpeg.NewPCMCommand` (or `NewPCMCommandUA`, which additionally sends the extracting client's User-Agent), which captures ffmpeg **stderr** for every parser: lines that look like HTTP 403 / forbidden / conversion failures are logged at **Warn**, other lines at **Debug** to limit noise. The binary paths default to `ffmpeg` / `yt-dlp` on `PATH` and can be overridden via `ffmpeg.FFmpegPath` / `ytdlp.YtdlpPath`.
+
+**Manual regression checklist**
+
+1. Broken or geo-blocked URL three `/play` commands in a row — no “wrong” error attributed to a later play; guild message shows failure when playback dies after start.
+2. Enqueue while something is playing — queue / status messages stay consistent.
+3. `/next` onto a broken next track — error text matches other failure paths (same length cap / phrasing family).
+
+## Track cache & anti-skip buffer (optional)
+
+Two opt-in playback layers, both off by default. The cache sits inside `RecoveryStream`, around the
+parser stream; the buffer sits outside it, around `RecoveryStream` itself:
+
+- **Track cache** (`stream.SetCache`) — while a track plays, `RecoveryStream` copies each
+  delivered Opus packet into a content-keyed disk blob (`cache.Key`: `youtube:<id>` /
+  `soundcloud:<url>`; radio is uncacheable), spanning parser switches and transport reopens and
+  committing only on a clean end. `Open` then tries the cache **before** the parser list, so later
+  plays (any consumer) serve from disk — instant, no extraction, no ffmpeg. Misses fall through to
+  the parser chain, so the cache never blocks playback. Global LRU size cap; persistent by default.
+- **Anti-skip buffer** (`stream.SetBufferAhead`) — `opus.BufferedReader` reads ahead so a source
+  stall drains the queued lead instead of stuttering. A lead only builds while the source outruns
+  playback, which is what decides whether any of this helps — `parsers/ytnative/chunked.go` has the
+  measurements and why that parser fetches in ranged chunks.
+  Consume it through `RecoveryStream.Packets()`,
+  which wraps the recovery stream rather than the parser stream underneath it: below recovery, a
+  reopen tears the buffer down along with the stream it wraps and the consumer blocks for the whole
+  reconnect, which is the opposite of what the buffer is for. Above it, the lead plays on while the
+  reopen happens, and `seekSec` advancing at the read-ahead position is exactly right — the buffer
+  holds everything in between.
+
+## Key extension points
+
+- **Custom resolver**: implement `player.Resolver` to support new sources or search.
+- **Ranked search**: implement `sources.Searcher` (`Search(query, limit) ([]SearchResult, error)`) on a source that has results worth choosing between. Deliberately not part of `Source`: radio has nothing to rank.
+- **Custom sink**: implement `sink.AudioSink` / `sink.Provider` to support new outputs.
+- **New parser**: implement `parsers.Streamer.Open` (returning an `opus.Reader`) and add it to `stream.registryEntries`.
+
+## Requirements
+
+- **ffmpeg** — Optional. Used by the transcode parsers (SoundCloud, radio, and the `kkdai-link`/`ytdlp-*` fallbacks) to decode audio; YouTube passthrough (`ytnative-link`, `kkdai-pipe`) needs no ffmpeg. Install it on `PATH` for full source coverage.
+- **yt-dlp** — Optional for ordinary videos; required for YouTube live broadcasts, which are HLS and which no other parser here can follow. If installed, the ytdlp-link and ytdlp-pipe parsers are available. It also wants a **JavaScript runtime** on `PATH` (deno, node or bun): without one it falls back to a YouTube client googlevideo serves under restrictions, and live streams stop after twenty-odd seconds.
+- **ebitengine/oto** — The speaker sink (`sink.NewSpeakerProvider()`) uses [oto](https://github.com/ebitengine/oto/v3) for audio output. Omit the speaker sink if you only need a custom sink (e.g. Discord).
+
+## Documentation
+
+- [player](player) — Queue-based playback engine
+- [resolve](resolve) — Resolve URLs and search to track metadata
+- [sink](sink) — Audio sink interfaces and speaker implementation
+- [sources](sources) — Source interface and track types
+- [parsers](parsers) — Streamer interface and track type
+- [stream](stream) — Track stream opening and recovery
+- [cache](cache) — Optional global, content-keyed track cache (opt-in)
+
+## License
+
+music is licensed under the [MIT License](https://opensource.org/licenses/MIT).

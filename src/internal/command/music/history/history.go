@@ -1,0 +1,180 @@
+package history
+
+import (
+	"fmt"
+	"strings"
+
+	"github.com/keshon/melodix/internal/command/music/common"
+	"github.com/keshon/melodix/internal/discord"
+	"github.com/keshon/melodix/internal/discord/adapter"
+	"github.com/keshon/melodix/internal/discord/reply"
+)
+
+type History struct {
+	Bot discord.VoiceAPI
+}
+
+func (c *History) Name() string { return "history" }
+func (c *History) Description() string {
+	return "Show recently played tracks (replay by id with /play)"
+}
+func (c *History) Group() string            { return "music" }
+func (c *History) Category() string         { return "🎵 Music" }
+func (c *History) UserPermissions() []int64 { return []int64{} }
+
+// discordgo requires a pointer for MinValue on slash options.
+var historyPageMinValue = 1.0
+
+func (c *History) SlashDefinition() *adapter.SlashCommand {
+	return &adapter.SlashCommand{
+		Name:        c.Name(),
+		Description: c.Description(),
+		Options: []adapter.SlashOption{
+			{
+				Type:        adapter.OptionString,
+				Name:        "view",
+				Description: "Chronological list or plays per link",
+				Required:    false,
+				Choices: []adapter.SlashChoice{
+					{Name: "Timeline", Value: "timeline"},
+					{Name: "By URL", Value: "counts"},
+				},
+			},
+			{
+				Type:        adapter.OptionInteger,
+				Name:        "page",
+				Description: "Page number (default 1)",
+				Required:    false,
+				MinValue:    &historyPageMinValue,
+			},
+		},
+	}
+}
+
+const historyLinesPerPage = 15
+
+const historyFooterReplay = "replay with `/play <id>`."
+
+func (c *History) Run(slashCtx *adapter.SlashInteractionContext) error {
+
+	store := slashCtx.Storage
+
+	var view = "timeline"
+	if v := strings.TrimSpace(slashCtx.StringOption("view")); v != "" {
+		view = v
+	}
+	// Absent reads as zero, and the first page is one.
+	page := slashCtx.IntOption("page")
+	if page < 1 {
+		page = 1
+	}
+
+	if err := slashCtx.Defer(); err != nil {
+		return fmt.Errorf("failed to send deferred response: %w", err)
+	}
+
+	guildID := slashCtx.GuildID()
+	if c.Bot.GetOrCreatePlayer(guildID) == nil {
+		slashCtx.FollowupEphemeral(&adapter.Embed{
+			Title:       "🎵 Error",
+			Description: "Music service is not available.",
+		})
+		return nil
+	}
+
+	if store == nil {
+		slashCtx.FollowupEphemeral(&adapter.Embed{
+			Title:       "🎵 Error",
+			Description: "Music history storage is not available.",
+		})
+		return nil
+	}
+
+	rows, err := store.ListMusicPlaybackTimeline(guildID)
+	if err != nil {
+		slashCtx.FollowupEphemeral(&adapter.Embed{
+			Title:       "🎵 History",
+			Description: fmt.Sprintf("Could not load history: %v", err),
+		})
+		return nil
+	}
+
+	if len(rows) == 0 {
+		slashCtx.FollowupEphemeral(&adapter.Embed{
+			Title:       "🎵 History",
+			Description: "No playback history yet. Use `/play` first. History is stored per server; very old entries may be removed when the list is trimmed.",
+			Color:       reply.EmbedColor,
+		})
+		return nil
+	}
+
+	view = strings.ToLower(strings.TrimSpace(view))
+	if view == "" {
+		view = "timeline"
+	}
+
+	var lines []string
+	var totalRows int
+	var embedTitle string
+	var footerExtra string
+
+	switch view {
+	case "counts":
+		counts := aggregatePlaybackCounts(rows)
+		totalRows = len(counts)
+		embedTitle = "🎵 Playback history (by URL)"
+		footerExtra = historyFooterReplay
+		for _, r := range counts {
+			lines = append(lines, common.FormatCountsLine(r.RepresentativeID, r.Title, r.URL, r.Count))
+		}
+	default:
+		totalRows = len(rows)
+		embedTitle = "🎵 Playback history (timeline)"
+		footerExtra = "Chronological; " + historyFooterReplay
+		for _, m := range rows {
+			lines = append(lines, common.FormatTimelineLine(m.ID, m.Title, m.URL, m.PlayedAt))
+		}
+	}
+
+	totalPages := (totalRows + historyLinesPerPage - 1) / historyLinesPerPage
+	if totalPages < 1 {
+		totalPages = 1
+	}
+	if page < 1 {
+		page = 1
+	}
+	if int64(totalPages) > 0 && page > int64(totalPages) {
+		page = int64(totalPages)
+	}
+
+	start := int((page - 1) * int64(historyLinesPerPage))
+	if start >= len(lines) {
+		start = 0
+		page = 1
+	}
+	end := start + historyLinesPerPage
+	if end > len(lines) {
+		end = len(lines)
+	}
+
+	var b strings.Builder
+	for _, line := range lines[start:end] {
+		b.WriteString(line)
+		b.WriteByte('\n')
+	}
+	desc := strings.TrimSpace(b.String())
+	if len(desc) > 4000 {
+		desc = desc[:3997] + "..."
+	}
+
+	embed := &adapter.Embed{
+		Title:       embedTitle,
+		Description: desc,
+		Footer:      fmt.Sprintf("Page %d/%d (%d rows). %s", page, totalPages, totalRows, footerExtra),
+		Color:       reply.EmbedColor,
+	}
+	if err := slashCtx.Followup(embed); err != nil {
+		slashCtx.AppLog.Warn().Str("command", "history").Err(err).Msg("followup_embed_failed")
+	}
+	return nil
+}

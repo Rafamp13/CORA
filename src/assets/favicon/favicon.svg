@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="32" height="32"
+     role="img" aria-label="Cora">
+  <title>Cora</title>
+  <!-- Favicon build source. Unlike logo.svg this carries its own colours and
+       its own ground: browser chrome cannot resolve currentColor, and a tab
+       strip may be any shade, so the mark sits on the dark disc the avatar
+       always had. Geometry matches logo.svg, scaled 24 -> 32. -->
+  <rect width="32" height="32" rx="7" fill="#171118"/>
+  <g transform="translate(16 16) scale(1.3333)">
+    <circle r="10.6" fill="none" stroke="#e13a86" stroke-width="1.7"/>
+    <circle r="8.1" fill="none" stroke="#f2e9ee" stroke-width="1.2" opacity=".5"/>
+    <circle r="5.4" fill="none" stroke="#f2e9ee" stroke-width="1.5"/>
+    <circle r="2.3" fill="#f2e9ee"/>
+  </g>
+</svg>

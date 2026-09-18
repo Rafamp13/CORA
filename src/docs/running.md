@@ -1,0 +1,157 @@
+# Running Cora
+
+Cora runs two ways: as a Discord bot, or as a standalone CLI player. This
+guide covers both.
+
+---
+
+## Requirements
+
+- FFmpeg in `PATH` (optional if YouTube only)
+- yt-dlp (recommended, not required)
+
+### yt-dlp and JavaScript
+
+Install a JavaScript runtime — Node, Deno or Bun — and leave it on `PATH`.
+That is the whole requirement; nothing needs configuring.
+
+Without one, yt-dlp cannot solve YouTube's challenges and falls back to a
+client googlevideo serves under restrictions. Ordinary videos still play, so
+the gap is easy to miss, but live broadcasts stop after twenty to forty
+seconds as their segments start answering 403. With a runtime present the bot
+selects the embedded web client itself on every yt-dlp call, which is what
+avoids that.
+
+The log says which way it went, on the first yt-dlp call:
+
+```
+ytdlp_youtube_client_configured js_runtime=node player_client=web_embedded
+ytdlp_no_js_runtime_live_streams_will_fail looked_for=["deno","node","bun"]
+```
+
+The Docker image ships Node, so it needs nothing further.
+
+### Proxies
+
+If YouTube is throttled or blocked where the bot runs, the standard environment
+variables are enough — there is no setting for this, because none is needed:
+
+```bash
+HTTPS_PROXY=http://proxy.example:8080
+```
+
+Every HTTP request Cora makes goes through Go's default transport, which
+reads `HTTPS_PROXY`, `HTTP_PROXY` and `NO_PROXY`. That covers the native
+extractors, search, playlists, SoundCloud and radio. yt-dlp and ffmpeg are
+started without a scrubbed environment, so they inherit the same variables;
+ffmpeg reads the lowercase `http_proxy`, so set both spellings if you rely on
+it.
+
+To proxy only the media side and leave Discord alone:
+
+```bash
+NO_PROXY=discord.com,discordapp.com,discord.media
+```
+
+`NO_PROXY` bypasses the *proxy*, not a VPN — those work at different layers, so
+a tunnel still carries what this exempts.
+
+Voice audio never goes through any of it. It is UDP straight to Discord, and an
+HTTP proxy cannot carry it.
+
+---
+
+## Discord bot
+
+### Step 1: Create the bot
+
+1. Open https://discord.com/developers/applications
+2. Create a new application
+3. Go to the "Bot" tab
+4. Create the bot and copy its token — you'll need it in a moment
+
+While you're there, enable one privileged intent: **Server Members**. Permission
+checks read the member cache, and a member missing from it is a command refused
+rather than a command run with fewer rights.
+
+Presence and Message Content are not needed. Cora does not ask for them, and
+asking for a privileged intent nothing reads is a connection Discord refuses
+outright the day somebody sets this up without ticking all three boxes.
+
+### Step 2: Invite it to a server
+
+Swap in your own application ID and open this URL:
+
+https://discord.com/oauth2/authorize?client_id=YOUR_APPLICATION_ID&scope=bot&permissions=3238912
+
+### Step 3: Configure
+
+Create a `.env` file (or just export the variables directly):
+
+```env
+DISCORD_TOKEN=your-token
+```
+
+That's the only one that's required. Everything else below has a sane
+default and can be left alone until you actually need it:
+
+| Variable                  | Description                                                | Default                 |
+| ------------------------- | ---------------------------------------------------------- | ------------------------ |
+| `DISCORD_TOKEN`           | The bot token from Step 1. Required; the bot exits without it. | (none) |
+| `STORAGE_PATH`            | Directory the datastore owns (write-ahead log + snapshots). Locked to one process. | `./data/store` |
+| `INIT_SLASH_COMMANDS`     | Set to `true` to register slash commands on every startup. | `false`                 |
+| `DEVELOPER_ID`            | Your Discord user ID, for developer-only commands.          | (none)                  |
+| `DISCORD_GUILD_BLACKLIST` | Comma-separated guild IDs the bot will leave on sight.      | (none)                  |
+| `VOICE_READY_DELAY_MS`    | Delay after joining a voice channel before asking whether it uses end-to-end encryption. The protocol version is not known until `SELECT_PROTOCOL_ACK` arrives, and before that the answer cannot tell "no encryption here" from "not asked yet". | `500` |
+| `WS_SILENCE_TIMEOUT`      | How long without events or heartbeat ACKs before the gateway is treated as unhealthy. | `2m`  |
+| `DISCORD_UNHEALTHY_MODE`  | What to do when unhealthy: `restart-session`, `restart-voice`, or `ignore`. | `restart-session` |
+| `DISCORD_UNHEALTHY_GRACE` | Under `restart-session`, ignore the first N unhealthy signals in the window below (sinks still get invalidated). | `0` |
+| `DISCORD_UNHEALTHY_WINDOW`| The window `DISCORD_UNHEALTHY_GRACE` counts within.         | `1m`                    |
+| `PLAYER_TRANSPORT_RECOVERY_MODE` | On a voice transport failure: `hard` rejoins the voice channel outright, `soft` tries reopening the stream first and falls back to hard. | `hard` |
+| `PLAYER_TRANSPORT_SOFT_ATTEMPTS` | In `soft` mode, how many soft retries happen before falling back to hard. | `1` |
+| `CACHE_ENABLED`           | Cache played tracks to disk, so later plays — from any guild, or via `/play <id>` — serve instantly with no re-extraction. | `false` |
+| `CACHE_DIR`               | Where cache blobs live (wiped on boot unless persistent).   | `./data/cache`           |
+| `CACHE_MAX_BYTES`         | Global cache size cap; oldest-used tracks get evicted once it's hit. | `2147483648` (2 GiB) |
+| `CACHE_PERSISTENT`        | Keep the cache across restarts, or wipe it on every boot (`false`). | `true`             |
+| `BUFFER_AHEAD_MS`         | Read-ahead depth in ms. The queued lead plays through a source stall or a reconnect, so on a lossy link this decides whether a dropped connection is audible. Costs roughly 17 KB per buffered second per guild at YouTube's usual bitrate — about 500 KB at the default depth — and does not pre-fill, so raising it delays nothing. Set to `0` to disable. | `30000` |
+| `MAX_AUDIO_BITRATE`       | Cap on the YouTube audio format the native parser picks, in bits per second. `0` takes the best on offer, which is the default: unasked, tracks play at the best quality their source has. The cap is for links that cannot carry that — end-to-end encryption means Discord relays what is sent without transcoding it, so this is the rate every listener receives. Worth setting on a slow link, where it also halves what is re-fetched when a dropped stream is reopened. | `0` |
+| `COMMAND_PARALLELISM`     | Max command handlers running at once, across all guilds. Within one guild commands always run one at a time, because a guild's music is sequential. | `16` |
+| `LOG_LEVEL`               | `trace`, `debug`, `info`, `warn`, `error`, `fatal` or `panic`. The Discord library is logged at the same level, so `debug` is loud. | `info` |
+| `LOG_FILE`                | Path to a rotated JSON log. Empty means stderr only, pretty-printed. | (none) |
+| `LOG_MAX_SIZE_MB`         | Rotate the log file once it reaches this size.              | `10` |
+| `LOG_MAX_BACKUPS`         | How many rotated files to keep.                             | `3` |
+| `LOG_MAX_AGE_DAYS`        | Delete rotated files older than this; `0` keeps them by count alone. | `0` |
+| `LOG_COMPRESS`            | Gzip rotated files.                                         | `false` |
+
+### Step 4: Run it
+
+```bash
+go build -o cora-discord ./cmd/discord
+./cora-discord
+```
+
+---
+
+## CLI player
+
+No Discord account needed here — it plays straight to your speakers.
+
+```bash
+go build -o melodix-cli ./cmd/cli
+./melodix-cli
+```
+
+Once it's running:
+
+* `play <url or query>`
+* `next`
+* `stop`
+* `queue`
+* `status`
+* `quit`
+
+---
+
+## Docker
+
+Covered separately in `docker/README.md`.

@@ -1,0 +1,41 @@
+package maintenance
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+
+	"github.com/keshon/melodix/internal/discord/adapter"
+	"github.com/keshon/melodix/internal/discord/reply"
+	"github.com/keshon/melodix/internal/storage"
+)
+
+func runExportData(ctx *adapter.SlashInteractionContext, storage storage.Storage) error {
+	guildID := ctx.GuildID()
+	record, err := storage.ExportGuild(guildID)
+	if err != nil {
+		return ctx.RespondEphemeral(&adapter.Embed{
+			Description: fmt.Sprintf("Failed to fetch record: ```%v```", err),
+			Color:       reply.EmbedColor,
+		})
+	}
+
+	jsonBytes, err := json.MarshalIndent(record, "", "  ")
+	if err != nil {
+		return ctx.RespondEphemeral(&adapter.Embed{
+			Description: fmt.Sprintf("JSON encode failed: ```%v```", err),
+			Color:       reply.EmbedColor,
+		})
+	}
+
+	embed := &adapter.Embed{
+		Title:       "🧠 Database Dump",
+		Description: "Here’s your current in-memory datastore snapshot.",
+		Color:       reply.EmbedColor,
+	}
+
+	fileName := fmt.Sprintf("%s_database_dump.json", guildID)
+	return ctx.RespondWith(adapter.Reply{
+		Embed: embed, File: bytes.NewReader(jsonBytes), FileName: fileName, Ephemeral: true,
+	})
+}

@@ -1,0 +1,25 @@
+# Secrets / local environment
+.env
+*.env.local
+
+# Go build outputs
+cora-discord
+bin/
+dist/
+build/
+
+# Go caches / coverage
+.coverprofile
+coverage.out
+
+# Runtime data
+data/datastore.json
+data/*.db
+data/*.sqlite
+data/*.sqlite3
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

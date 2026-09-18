@@ -1,0 +1,139 @@
+![Cora banner](https://raw.githubusercontent.com/keshon/melodix/main/assets/readme-banner.webp)
+
+[![Go Reference](https://pkg.go.dev/badge/github.com/keshon/melodix.svg)](https://pkg.go.dev/github.com/keshon/melodix) [![Release](https://img.shields.io/github/v/release/keshon/melodix)](https://github.com/keshon/melodix/releases) [![License](https://img.shields.io/github/license/keshon/melodix)](LICENSE)
+
+# Cora
+
+A self-hosted Discord music bot written in Go, built around one stubborn idea:
+playback should survive — flaky streams, dead voice connections, gateway
+reconnects, all of it. It streams YouTube, SoundCloud and internet radio, and
+for YouTube it hands Discord the original Opus audio without re-encoding it.
+
+Public music bots tend to disappear eventually, usually with a
+cease-and-desist attached. Cora skips that risk: it's a small binary you
+run yourself, with your own token, on your own machine. Nobody can turn it
+off for you.
+
+## What it does
+
+- Plays YouTube, SoundCloud and internet radio, across as many servers as you
+  put it in — one binary, one machine.
+- Never re-encodes the YouTube path. YouTube serves Opus, Discord wants Opus,
+  so the packets go through as they are — less CPU, no second-generation
+  quality loss, and no ffmpeg to install. SoundCloud and radio aren't served
+  in a forwardable format, so those take the ffmpeg route.
+- Falls through when an extractor breaks, and they do break. Every track has
+  several behind it — native, kkdai, yt-dlp — and a stream that dies mid-play
+  reopens where it stopped rather than starting the song again.
+- Survives Discord too. A silent gateway or a dead voice connection is spotted
+  and recovered on its own, and the queue lives through the reconnect.
+- Numbers everything it plays, so something from last week is `/play 42`
+  rather than a scroll back through chat. Turn the track cache on and a repeat
+  never touches the network at all.
+- Keeps its state in a directory you choose — an embedded write-ahead log
+  ([datastore](https://github.com/keshon/datastore)) that survives being killed
+  mid-write. No database server, no migrations.
+- Doubles as a terminal player: the same engine drives `melodix-cli`, straight
+  to your speakers, no Discord account involved.
+
+## See it work
+
+| Pick the right hit | Queue a whole playlist | Replay from history |
+|:---:|:---:|:---:|
+| [![Discord: /search returns five results with uploader and duration, picked with a numbered button](https://raw.githubusercontent.com/keshon/melodix/main/assets/demo-search.gif)](https://raw.githubusercontent.com/keshon/melodix/main/assets/demo-search.gif) | [![Discord: /play with a YouTube playlist link queues 70 tracks](https://raw.githubusercontent.com/keshon/melodix/main/assets/demo-play-youtube-playlist.gif)](https://raw.githubusercontent.com/keshon/melodix/main/assets/demo-play-youtube-playlist.gif) | [![Discord: /history lists past tracks by id, then /play 45 16 15 replays them](https://raw.githubusercontent.com/keshon/melodix/main/assets/demo-history-multiple-play.gif)](https://raw.githubusercontent.com/keshon/melodix/main/assets/demo-history-multiple-play.gif) |
+| `/search` lists five results with uploader and length; one button press queues the one you meant. | One link, 70 tracks queued behind the first. | `/history` gives every track an id, so `/play 45 16 15` queues three of them straight back. |
+
+Click any of them to play full size.
+
+## What it doesn't do
+
+A niche bot, and the niche is worth naming: music on servers you run yourself,
+for people you know. Several things people reasonably expect are missing
+because of that, and it's better to find out here than after installing.
+
+- **No volume control or audio filters.** Both mean decoding and re-encoding
+  every packet, which is the one thing the audio path is built to avoid.
+  Discord's own per-user volume still works.
+- **No web dashboard.** Configuration is environment variables and slash
+  commands. Nothing to log into, nothing listening on a port.
+- **No accounts, premium tier or telemetry.** Your token, your machine,
+  nothing phoning home.
+- **No Spotify, Apple Music or Tidal.** Their audio is DRM-protected. Quietly
+  playing whichever YouTube video matches the title is a different product,
+  and a worse one.
+- **No loop, shuffle or seek** — yet. Nothing in the way; they just aren't
+  built.
+- **No horizontal scaling.** One process is one failure domain, sized for
+  servers you know rather than for hosting hundreds. A supervisor brings it
+  back in seconds, but a crash still costs the queue.
+- **Doesn't squat in the channel.** When the queue runs out it leaves.
+
+## Get it running
+
+Hear it before you install anything: the bot lives in the
+[Ctrl+Z](https://discord.gg/uDnTenPxAY) Discord server — join a voice channel
+and use slash commands in `#music-spam`.
+
+To run your own, take a binary from the
+[releases page](https://github.com/keshon/melodix/releases), put your token in
+`.env`, and start it. Nothing to compile, no runtime to install.
+
+From source instead, with Go 1.26 or newer:
+
+```bash
+# Discord bot — token from the Discord Developer Portal
+go build -o cora-discord ./cmd/discord
+DISCORD_TOKEN=your-token ./cora-discord
+
+# ...or the terminal player, no Discord account required
+go build -o melodix-cli ./cmd/cli
+./melodix-cli
+```
+
+FFmpeg is only needed for SoundCloud and internet radio. yt-dlp is a
+last-resort fallback, optional except for YouTube live broadcasts, and it wants
+a JavaScript runtime on `PATH` to be useful. The full setup guide — creating
+the bot, invite link, every config knob, Docker — is in
+[docs/running.md](docs/running.md).
+
+## Commands
+
+<!-- generated -->
+
+{{ .CommandSections }}
+
+<!-- /generated -->
+
+`/play` takes more than links:
+
+```text
+/play never gonna give you up                       search query (YouTube)
+/play https://www.youtube.com/watch?v=dQw4w9WgXcQ   direct link (YouTube / SoundCloud)
+/play https://www.youtube.com/playlist?list=PL...   whole YouTube playlist
+/play https://www.youtube.com/watch?v=...&list=RD   YouTube mix / radio
+/play http://stream-uk1.radioparadise.com/aac-320   internet radio stream
+/play 42                                            replay entry 42 from /history
+/play 45 16 15                                      replay several, in that order
+```
+
+Any link carrying a `list=` queues the whole list, up to 100 tracks, and
+`/queue` shows what is waiting. A link that names a video *and* a list
+(`watch?v=...&list=...`) starts at that video and continues through the rest,
+the same as opening it on YouTube. To play a single track, link it without the
+`list=` part.
+
+## Under the hood
+
+The playback engine ([pkg/music](pkg/music)) is a standalone Go library with
+no Discord in it: resolver → queue → recovery stream → sink. The Discord bot
+is one consumer of it, the CLI is another. If you're curious how the parser
+fallback and voice recovery actually work, [docs/architecture.md](docs/architecture.md)
+walks through the whole thing.
+
+House rules — naming, concurrency contracts, how to add a source or parser —
+are in [docs/conventions.md](docs/conventions.md), where every rule carries the
+check that enforces it or says plainly that nothing does.
+
+## License
+
+[MIT](LICENSE) © Innokentiy Sokolov (Señor Mega / Big M)
