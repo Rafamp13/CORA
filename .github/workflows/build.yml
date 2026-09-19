@@ -27,104 +27,18 @@ jobs:
       - name: Install Linux audio development dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
-            libasound2-dev \
-            libpulse-dev
+          sudo apt-get install -y libasound2-dev libpulse-dev
 
-      - name: Apply visible branding
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          python3 - <<'PY'
-          from pathlib import Path
-
-          replacements = [
-              ("Melodix Player", "Cora • Kiba Sound Studios™"),
-              ("Melodix", "Cora"),
-              ("melodix-discord", "cora-discord"),
-          ]
-
-          text_exts = {
-              ".md", ".txt", ".yaml", ".yml", ".json", ".toml",
-              ".html", ".css", ".js", ".ts", ".xml", ".ini",
-              ".conf", ".tmpl", ".env", ".example"
-          }
-
-          root = Path("src")
-
-          for path in root.rglob("*"):
-              if not path.is_file():
-                  continue
-
-              if path.suffix.lower() not in text_exts:
-                  continue
-
-              try:
-                  old = path.read_text(encoding="utf-8")
-              except UnicodeDecodeError:
-                  continue
-
-              new = old
-
-              for before, after in replacements:
-                  new = new.replace(before, after)
-
-              if new != old:
-                  path.write_text(new, encoding="utf-8")
-          PY
-
-      - name: Verify Go module
+      - name: Build CORA
         working-directory: src
-        shell: bash
+        env:
+          CGO_ENABLED: '1'
+          GOOS: linux
+          GOARCH: amd64
         run: |
           set -euo pipefail
-
-          test -f go.mod
-          test -f go.sum
-
-          echo "=== Go version ==="
-          go version
-
-          echo "=== Build environment ==="
-          go env GOOS GOARCH CGO_ENABLED CC
-
-          echo "=== Download dependencies ==="
           go mod download
-
-      - name: Verify Oto
-        working-directory: src
-        env:
-          CGO_ENABLED: '1'
-          GOOS: linux
-          GOARCH: amd64
-        run: |
-          set -euo pipefail
-
-          echo "=== Oto module ==="
-          go list -m -json github.com/ebitengine/oto/v3
-
-          echo "=== Oto package ==="
-          go list -json github.com/ebitengine/oto/v3 > /tmp/oto-package.json
-
-          grep -E '"GoFiles"|"CgoFiles"|"IgnoredGoFiles"' /tmp/oto-package.json || true
-
-      - name: Build Cora
-        working-directory: src
-        shell: bash
-        env:
-          CGO_ENABLED: '1'
-          GOOS: linux
-          GOARCH: amd64
-        run: |
-          set -euo pipefail
-
-          go build \
-            -trimpath \
-            -ldflags="-s -w" \
-            -o ../cora-discord \
-            ./cmd/discord
-
+          go build -trimpath -ldflags="-s -w" -o ../cora-discord ./cmd/discord
           file ../cora-discord
           test -x ../cora-discord
 
@@ -136,21 +50,23 @@ jobs:
           rm -rf artifact
           mkdir -p artifact/CORA/data
 
-          cp discloud.config artifact/CORA/
-          cp .env.example artifact/CORA/
-          cp README.md artifact/CORA/
-          cp cora-discord artifact/CORA/
+          cp discloud.config artifact/CORA/discloud.config
+          cp .env.example artifact/CORA/.env.example
+          cp README.md artifact/CORA/README.md
+          cp cora-discord artifact/CORA/cora-discord
+          cp index.js artifact/CORA/index.js
 
           touch artifact/CORA/data/.gitkeep
+
+          echo "=== CORA artifact ==="
+          find artifact/CORA -maxdepth 2 -type f -printf '%P\n' | sort
 
           test -f artifact/CORA/discloud.config
           test -f artifact/CORA/.env.example
           test -f artifact/CORA/README.md
           test -f artifact/CORA/cora-discord
+          test -f artifact/CORA/index.js
           test -f artifact/CORA/data/.gitkeep
-
-          echo "=== CORA artifact ==="
-          find artifact/CORA -maxdepth 2 -type f -printf '%P\n' | sort
 
       - name: Upload artifact CORA
         uses: actions/upload-artifact@v5
