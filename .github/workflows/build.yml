@@ -2,10 +2,6 @@ name: Build CORA
 
 on:
   workflow_dispatch:
-name: Build CORA
-
-on:
-  workflow_dispatch:
   push:
     branches:
       - main
@@ -27,6 +23,13 @@ jobs:
           go-version: '1.26.0'
           cache: true
           cache-dependency-path: src/go.sum
+
+      - name: Install Linux audio development dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libasound2-dev \
+            libpulse-dev
 
       - name: Apply visible branding
         shell: bash
@@ -83,43 +86,34 @@ jobs:
           echo "=== Go version ==="
           go version
 
-          echo "=== Go environment ==="
-          go env GOOS GOARCH CGO_ENABLED
-
-          echo "=== Module ==="
-          head -n 10 go.mod
+          echo "=== Build environment ==="
+          go env GOOS GOARCH CGO_ENABLED CC
 
           echo "=== Download dependencies ==="
           go mod download
 
-      - name: Verify Oto platform files
+      - name: Verify Oto
         working-directory: src
-        shell: bash
         env:
-          CGO_ENABLED: '0'
+          CGO_ENABLED: '1'
           GOOS: linux
           GOARCH: amd64
         run: |
           set -euo pipefail
 
-          OTO_DIR="$(go env GOPATH)/pkg/mod/github.com/ebitengine/oto/v3@v3.4.1"
+          echo "=== Oto module ==="
+          go list -m -json github.com/ebitengine/oto/v3
 
-          echo "=== Oto directory ==="
-          echo "$OTO_DIR"
+          echo "=== Oto package ==="
+          go list -json github.com/ebitengine/oto/v3 > /tmp/oto-package.json
 
-          test -d "$OTO_DIR"
-
-          echo "=== Oto driver files ==="
-          find "$OTO_DIR" -maxdepth 1 -type f -name '*.go' -printf '%f\n' | sort
-
-          echo "=== Selected Oto package ==="
-          go list -json github.com/ebitengine/oto/v3
+          grep -E '"GoFiles"|"CgoFiles"|"IgnoredGoFiles"' /tmp/oto-package.json || true
 
       - name: Build Cora
         working-directory: src
         shell: bash
         env:
-          CGO_ENABLED: '0'
+          CGO_ENABLED: '1'
           GOOS: linux
           GOARCH: amd64
         run: |
@@ -157,106 +151,6 @@ jobs:
 
           echo "=== CORA artifact ==="
           find artifact/CORA -maxdepth 2 -type f -printf '%P\n' | sort
-
-      - name: Upload artifact CORA
-        uses: actions/upload-artifact@v4
-        with:
-          name: CORA
-          path: artifact/CORA
-          if-no-files-found: error
-          retention-days: 7  push:
-    branches:
-      - main
-
-permissions:
-  contents: read
-
-jobs:
-  build:
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Go 1.26
-        uses: actions/setup-go@v5
-        with:
-          go-version: '1.26'
-          cache: true
-          cache-dependency-path: src/go.sum
-
-      - name: Apply visible branding
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          python3 - <<'PY'
-          from pathlib import Path
-
-          replacements = [
-              ("Melodix Player", "Cora • Kiba Sound Studios™"),
-              ("Melodix", "Cora"),
-              ("melodix-discord", "cora-discord"),
-          ]
-
-          text_exts = {
-              ".md", ".txt", ".yaml", ".yml", ".json", ".toml",
-              ".html", ".css", ".js", ".ts", ".xml", ".ini",
-              ".conf", ".tmpl", ".env", ".example"
-          }
-
-          root = Path("src")
-          for path in root.rglob("*"):
-              if not path.is_file() or path.suffix.lower() not in text_exts:
-                  continue
-              try:
-                  old = path.read_text(encoding="utf-8")
-              except UnicodeDecodeError:
-                  continue
-              new = old
-              for before, after in replacements:
-                  new = new.replace(before, after)
-              if new != old:
-                  path.write_text(new, encoding="utf-8")
-          PY
-
-      - name: Verify Go module
-        working-directory: src
-        run: |
-          test -f go.mod
-          go version
-          go mod download
-
-      - name: Build Cora
-        working-directory: src
-        env:
-          CGO_ENABLED: '0'
-          GOOS: linux
-          GOARCH: amd64
-        run: |
-          go build -trimpath -ldflags="-s -w" -o ../cora-discord ./cmd/discord
-          file ../cora-discord
-          test -x ../cora-discord
-
-      - name: Package Discloud artifact
-        shell: bash
-        run: |
-          set -euo pipefail
-          rm -rf artifact
-          mkdir -p artifact/CORA/data
-
-          cp discloud.config artifact/CORA/
-          cp .env.example artifact/CORA/
-          cp README.md artifact/CORA/
-          cp cora-discord artifact/CORA/
-          touch artifact/CORA/data/.gitkeep
-
-          test -f artifact/CORA/discloud.config
-          test -f artifact/CORA/.env.example
-          test -f artifact/CORA/README.md
-          test -f artifact/CORA/cora-discord
-          test -f artifact/CORA/data/.gitkeep
 
       - name: Upload artifact CORA
         uses: actions/upload-artifact@v4
